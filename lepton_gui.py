@@ -1,6 +1,6 @@
 """
 FLIR Lepton IR Camera GUI
-Requires: opencv-python, Pillow, numpy
+Requires: opencv-python, Pillow, numpy, ultralytics
 Hardware: PureThermal USB board (UVC device)
 """
 
@@ -12,6 +12,12 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 import os
+
+try:
+    from ultralytics import YOLO as _YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
 
 # Available colormaps: (display name, cv2 colormap constant or None for grayscale)
 COLORMAPS = [
@@ -76,33 +82,43 @@ class LeptonCamera:
 
 class PersonDetector:
     """
-    HOG + SVM person detector (OpenCV built-in, no extra dependencies).
+    YOLOv8 person detector via the ultralytics package.
 
-    Detection is run on a grayscale upscaled copy of the sensor frame so
-    that the HOG sliding window has enough pixels to work with on the tiny
-    Lepton resolution.  Bounding boxes are scaled back to display coordinates
-    before being returned.
+    On first use the model weights (yolov8n.pt, ~6 MB) are downloaded
+    automatically by ultralytics and cached in ~/.config/Ultralytics/.
+
+    Detection is run on a 3-channel upscaled copy of the sensor frame so
+    YOLO has enough resolution to work with the tiny Lepton sensor.
+    Bounding boxes are returned in display coordinates.
     """
 
+    # YOLO COCO class index for "person"
+    _PERSON_CLASS = 0
+
     def __init__(self):
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        if not _YOLO_AVAILABLE:
+            raise RuntimeError(
+                "ultralytics is not installed.\n"
+                "Run:  pip install ultralytics"
+            )
+        # yolov8n = nano variant — fastest, smallest; swap to yolov8s/m for
+        # better accuracy at the cost of inference time
+        self._model = _YOLO("yolov8n.pt")
         self._lock = threading.Lock()
-        # Last detection results shared between detect thread and draw code
-        self._boxes: list[tuple[int, int, int, int]] = []   # (x,y,w,h) in display coords
+        self._boxes: list[tuple[int, int, int, int]] = []  # (x,y,w,h) display coords
         self._count: int = 0
 
     def detect(self, gray_frame: np.ndarray, display_w: int, display_h: int,
-               sensitivity: float = 0.0) -> tuple[list, int]:
+               sensitivity: float = 0.5) -> tuple[list, int]:
         """
-        Run detection on gray_frame, return (boxes_in_display_coords, count).
+        Run YOLOv8 on gray_frame; return (boxes_in_display_coords, count).
 
-        sensitivity: 0.0 = default threshold (fewer false positives),
-                     negative values increase recall at cost of precision.
+        sensitivity: 0.0–1.0 slider maps to confidence threshold
+                     0.0 → conf=0.10 (high recall), 1.0 → conf=0.90 (high precision)
         """
         src_h, src_w = gray_frame.shape
 
-        # Upscale to DETECT_WIDTH for HOG
+        # Upscale and convert to 3-channel BGR for YOLO
         scale = DETECT_WIDTH / src_w
         det_h = max(int(src_h * scale), 1)
         det_frame = cv2.resize(gray_frame, (DETECT_WIDTH, det_h),
@@ -111,33 +127,28 @@ class PersonDetector:
         # CLAHE contrast enhancement helps on flat thermal frames
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
         det_frame = clahe.apply(det_frame)
+        det_bgr = cv2.cvtColor(det_frame, cv2.COLOR_GRAY2BGR)
 
-        rects, weights = self.hog.detectMultiScale(
-            det_frame,
-            winStride=(4, 4),
-            padding=(8, 8),
-            scale=1.05,
-            hitThreshold=max(0.0, -sensitivity),   # lower = more sensitive
+        # Map sensitivity slider → confidence threshold (inverted)
+        conf_thresh = 0.90 - sensitivity * 0.80   # 0→0.90, 1→0.10
+
+        results = self._model.predict(
+            det_bgr,
+            classes=[self._PERSON_CLASS],
+            conf=conf_thresh,
+            verbose=False,
         )
 
-        if len(rects) == 0:
-            with self._lock:
-                self._boxes = []
-                self._count = 0
-            return [], 0
-
-        # Non-maximum suppression to merge overlapping boxes
-        rects_nms = self._nms(rects, overlapThresh=0.55)
-
-        # Scale boxes from detection coords → display coords
-        sx = display_w / DETECT_WIDTH
-        sy = display_h / det_h
         boxes = []
-        for (x, y, w, h) in rects_nms:
-            boxes.append((
-                int(x * sx), int(y * sy),
-                int(w * sx), int(h * sy),
-            ))
+        if results and len(results[0].boxes):
+            sx = display_w / DETECT_WIDTH
+            sy = display_h / det_h
+            for box in results[0].boxes:
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                boxes.append((
+                    int(x1 * sx), int(y1 * sy),
+                    int((x2 - x1) * sx), int((y2 - y1) * sy),
+                ))
 
         with self._lock:
             self._boxes = boxes
@@ -154,33 +165,6 @@ class PersonDetector:
     def last_boxes(self) -> list:
         with self._lock:
             return list(self._boxes)
-
-    @staticmethod
-    def _nms(rects, overlapThresh: float):
-        """Simple non-maximum suppression on (x,y,w,h) rectangles."""
-        if len(rects) == 0:
-            return []
-        boxes = np.array([[x, y, x + w, y + h] for (x, y, w, h) in rects],
-                         dtype=np.float32)
-        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-        area = (x2 - x1 + 1) * (y2 - y1 + 1)
-        idxs = np.argsort(y2)
-        pick = []
-        while len(idxs) > 0:
-            last = len(idxs) - 1
-            i = idxs[last]
-            pick.append(i)
-            xx1 = np.maximum(x1[i], x1[idxs[:last]])
-            yy1 = np.maximum(y1[i], y1[idxs[:last]])
-            xx2 = np.minimum(x2[i], x2[idxs[:last]])
-            yy2 = np.minimum(y2[i], y2[idxs[:last]])
-            w = np.maximum(0, xx2 - xx1 + 1)
-            h = np.maximum(0, yy2 - yy1 + 1)
-            overlap = (w * h) / area[idxs[:last]]
-            idxs = np.delete(idxs,
-                             np.concatenate(([last],
-                                             np.where(overlap > overlapThresh)[0])))
-        return [rects[i] for i in pick]
 
 
 def apply_colormap(gray_frame: np.ndarray, cmap_code) -> Image.Image:
@@ -595,6 +579,15 @@ class LeptonGUI:
     # ------------------------------------------------------------------ detection toggle
 
     def _on_detect_toggle(self):
+        if self.detect_var.get() and not _YOLO_AVAILABLE:
+            messagebox.showerror(
+                "Missing dependency",
+                "ultralytics is not installed.\n\nRun:\n  pip install ultralytics\n\n"
+                "YOLOv8n weights (~6 MB) will be downloaded automatically on first use."
+            )
+            self.detect_var.set(False)
+            return
+
         self._detect_enabled = self.detect_var.get()
         if self._detect_enabled:
             self.count_var.set("0")

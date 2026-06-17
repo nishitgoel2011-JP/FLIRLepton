@@ -157,7 +157,7 @@ class LeptonGUI:
                   width=22).grid(row=0, column=1, sticky="ew", **pad)
 
         ttk.Label(save_frame, text="Save to:").grid(row=1, column=0, sticky="w", **pad)
-        self.savedir_var = tk.StringVar(value=os.path.expanduser("~"))
+        self.savedir_var = tk.StringVar(value=os.path.join(os.getcwd(), 'Output'))
         ttk.Entry(save_frame, textvariable=self.savedir_var,
                   width=30).grid(row=1, column=1, columnspan=2, sticky="ew", **pad)
 

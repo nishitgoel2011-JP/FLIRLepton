@@ -10,7 +10,7 @@ import threading
 import time
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import os
 
 # Available colormaps: (display name, cv2 colormap constant or None for grayscale)
@@ -31,7 +31,10 @@ VIDEO_FORMATS = [
 ]
 
 DISPLAY_SCALE = 4   # Upscale factor for the small Lepton sensor
-TARGET_FPS = 9.0    # Lepton native frame rate (8.7 fps); used for VideoWriter
+TARGET_FPS = 9.0    # Lepton native frame rate (~8.7 fps)
+
+# HOG detection: upscale gray frame to this width before running detector
+DETECT_WIDTH = 320
 
 
 class LeptonCamera:
@@ -71,8 +74,116 @@ class LeptonCamera:
         self.cap.release()
 
 
+class PersonDetector:
+    """
+    HOG + SVM person detector (OpenCV built-in, no extra dependencies).
+
+    Detection is run on a grayscale upscaled copy of the sensor frame so
+    that the HOG sliding window has enough pixels to work with on the tiny
+    Lepton resolution.  Bounding boxes are scaled back to display coordinates
+    before being returned.
+    """
+
+    def __init__(self):
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        self._lock = threading.Lock()
+        # Last detection results shared between detect thread and draw code
+        self._boxes: list[tuple[int, int, int, int]] = []   # (x,y,w,h) in display coords
+        self._count: int = 0
+
+    def detect(self, gray_frame: np.ndarray, display_w: int, display_h: int,
+               sensitivity: float = 0.0) -> tuple[list, int]:
+        """
+        Run detection on gray_frame, return (boxes_in_display_coords, count).
+
+        sensitivity: 0.0 = default threshold (fewer false positives),
+                     negative values increase recall at cost of precision.
+        """
+        src_h, src_w = gray_frame.shape
+
+        # Upscale to DETECT_WIDTH for HOG
+        scale = DETECT_WIDTH / src_w
+        det_h = max(int(src_h * scale), 1)
+        det_frame = cv2.resize(gray_frame, (DETECT_WIDTH, det_h),
+                               interpolation=cv2.INTER_LINEAR)
+
+        # CLAHE contrast enhancement helps on flat thermal frames
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        det_frame = clahe.apply(det_frame)
+
+        rects, weights = self.hog.detectMultiScale(
+            det_frame,
+            winStride=(4, 4),
+            padding=(8, 8),
+            scale=1.05,
+            hitThreshold=max(0.0, -sensitivity),   # lower = more sensitive
+        )
+
+        if len(rects) == 0:
+            with self._lock:
+                self._boxes = []
+                self._count = 0
+            return [], 0
+
+        # Non-maximum suppression to merge overlapping boxes
+        rects_nms = self._nms(rects, overlapThresh=0.55)
+
+        # Scale boxes from detection coords → display coords
+        sx = display_w / DETECT_WIDTH
+        sy = display_h / det_h
+        boxes = []
+        for (x, y, w, h) in rects_nms:
+            boxes.append((
+                int(x * sx), int(y * sy),
+                int(w * sx), int(h * sy),
+            ))
+
+        with self._lock:
+            self._boxes = boxes
+            self._count = len(boxes)
+
+        return boxes, len(boxes)
+
+    @property
+    def last_count(self) -> int:
+        with self._lock:
+            return self._count
+
+    @property
+    def last_boxes(self) -> list:
+        with self._lock:
+            return list(self._boxes)
+
+    @staticmethod
+    def _nms(rects, overlapThresh: float):
+        """Simple non-maximum suppression on (x,y,w,h) rectangles."""
+        if len(rects) == 0:
+            return []
+        boxes = np.array([[x, y, x + w, y + h] for (x, y, w, h) in rects],
+                         dtype=np.float32)
+        x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        area = (x2 - x1 + 1) * (y2 - y1 + 1)
+        idxs = np.argsort(y2)
+        pick = []
+        while len(idxs) > 0:
+            last = len(idxs) - 1
+            i = idxs[last]
+            pick.append(i)
+            xx1 = np.maximum(x1[i], x1[idxs[:last]])
+            yy1 = np.maximum(y1[i], y1[idxs[:last]])
+            xx2 = np.minimum(x2[i], x2[idxs[:last]])
+            yy2 = np.minimum(y2[i], y2[idxs[:last]])
+            w = np.maximum(0, xx2 - xx1 + 1)
+            h = np.maximum(0, yy2 - yy1 + 1)
+            overlap = (w * h) / area[idxs[:last]]
+            idxs = np.delete(idxs,
+                             np.concatenate(([last],
+                                             np.where(overlap > overlapThresh)[0])))
+        return [rects[i] for i in pick]
+
+
 def apply_colormap(gray_frame: np.ndarray, cmap_code) -> Image.Image:
-    """Apply an OpenCV colormap (or None for grayscale) and return PIL Image."""
     if cmap_code is None:
         rgb = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB)
     else:
@@ -82,10 +193,36 @@ def apply_colormap(gray_frame: np.ndarray, cmap_code) -> Image.Image:
 
 
 def apply_colormap_bgr(gray_frame: np.ndarray, cmap_code) -> np.ndarray:
-    """Return a BGR uint8 array suitable for cv2.VideoWriter."""
     if cmap_code is None:
         return cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR)
     return cv2.applyColorMap(gray_frame, cmap_code)
+
+
+def draw_detections(pil_img: Image.Image, boxes: list, count: int) -> Image.Image:
+    """Draw bounding boxes and person count badge onto a PIL RGB image."""
+    if not boxes and count == 0:
+        return pil_img
+
+    img = pil_img.copy()
+    draw = ImageDraw.Draw(img)
+    box_color = (0, 255, 80)       # bright green
+    label_bg = (0, 180, 60)
+
+    for (x, y, w, h) in boxes:
+        draw.rectangle([x, y, x + w, y + h], outline=box_color, width=2)
+        label = "Person"
+        tw, th = 50, 14
+        draw.rectangle([x, y - th - 2, x + tw, y], fill=label_bg)
+        draw.text((x + 2, y - th - 1), label, fill=(255, 255, 255))
+
+    # Count badge — top-right corner
+    badge = f"Persons: {count}"
+    bw, bh = 110, 22
+    iw, ih = img.size
+    draw.rectangle([iw - bw - 4, 4, iw - 4, 4 + bh], fill=(20, 20, 20))
+    draw.text((iw - bw, 6), badge, fill=(0, 255, 80))
+
+    return img
 
 
 class LeptonGUI:
@@ -106,6 +243,13 @@ class LeptonGUI:
         self._video_frame_count = 0
         self._video_path = ""
 
+        # Person detection
+        self._detector = PersonDetector()
+        self._detect_enabled = False
+        self._detect_frame_skip = 0   # counter for throttling
+        self._last_boxes: list = []
+        self._last_count: int = 0
+
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -114,7 +258,7 @@ class LeptonGUI:
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
 
-        # ---- top: camera canvas ----
+        # ---- camera canvas ----
         self.canvas = tk.Canvas(self.root, bg="black",
                                 width=80 * DISPLAY_SCALE,
                                 height=60 * DISPLAY_SCALE)
@@ -142,12 +286,11 @@ class LeptonGUI:
 
         ttk.Label(cam_frame, text="Colormap:").grid(row=1, column=0, sticky="w", **pad)
         self.cmap_var = tk.StringVar(value=COLORMAPS[1][0])
-        cmap_names = [c[0] for c in COLORMAPS]
         ttk.Combobox(cam_frame, textvariable=self.cmap_var,
-                     values=cmap_names, state="readonly",
-                     width=12).grid(row=1, column=1, sticky="w", **pad)
+                     values=[c[0] for c in COLORMAPS],
+                     state="readonly", width=12).grid(row=1, column=1, sticky="w", **pad)
 
-        # ---- save controls (shared filename / directory) ----
+        # ---- save settings ----
         save_frame = ttk.LabelFrame(self.root, text="Save Settings")
         save_frame.grid(row=3, column=0, columnspan=2, sticky="ew", **pad)
 
@@ -169,7 +312,6 @@ class LeptonGUI:
                                       command=self._request_capture,
                                       state="disabled")
         self.capture_btn.grid(row=0, column=0, padx=8, pady=6)
-
         ttk.Label(img_frame, text="→ saves as <filename>.png").grid(
             row=0, column=1, sticky="w", padx=4)
 
@@ -194,10 +336,55 @@ class LeptonGUI:
                                      state="disabled")
         self.record_btn.grid(row=2, column=0, columnspan=2, pady=6)
 
-        # recording indicator label
         self.rec_indicator = tk.Label(vid_frame, text="", fg="red",
                                       font=("TkDefaultFont", 10, "bold"))
         self.rec_indicator.grid(row=3, column=0, columnspan=2)
+
+        # ---- person detection ----
+        det_frame = ttk.LabelFrame(self.root, text="Person Detection")
+        det_frame.grid(row=5, column=0, columnspan=2, sticky="ew", **pad)
+
+        # Enable toggle
+        self.detect_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(det_frame, text="Enable live person detection",
+                        variable=self.detect_var,
+                        command=self._on_detect_toggle).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+
+        # Sensitivity slider
+        ttk.Label(det_frame, text="Sensitivity:").grid(row=1, column=0, sticky="w", **pad)
+        self.sensitivity_var = tk.DoubleVar(value=0.5)
+        ttk.Scale(det_frame, from_=0.0, to=1.0, orient="horizontal",
+                  variable=self.sensitivity_var,
+                  length=140).grid(row=1, column=1, sticky="ew", **pad)
+        ttk.Label(det_frame, text="Low → High").grid(row=1, column=2, sticky="w")
+
+        # Overlay on saved files checkbox
+        self.overlay_save_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(det_frame,
+                        text="Include detection overlay in saved images/video",
+                        variable=self.overlay_save_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", **pad)
+
+        # Large person count display
+        count_panel = tk.Frame(det_frame, bg="#1a1a2e", bd=2, relief="sunken")
+        count_panel.grid(row=3, column=0, columnspan=3, sticky="ew",
+                         padx=6, pady=(2, 6))
+
+        tk.Label(count_panel, text="Persons detected:",
+                 bg="#1a1a2e", fg="#aaaacc",
+                 font=("TkDefaultFont", 10)).pack(side="left", padx=8)
+
+        self.count_var = tk.StringVar(value="—")
+        tk.Label(count_panel, textvariable=self.count_var,
+                 bg="#1a1a2e", fg="#00ff50",
+                 font=("TkDefaultFont", 28, "bold"),
+                 width=3, anchor="e").pack(side="left", padx=4)
+
+        self.det_status_var = tk.StringVar(value="Detection off")
+        tk.Label(count_panel, textvariable=self.det_status_var,
+                 bg="#1a1a2e", fg="#888888",
+                 font=("TkDefaultFont", 9)).pack(side="left", padx=12)
 
     # ------------------------------------------------------------------ camera control
 
@@ -245,6 +432,8 @@ class LeptonGUI:
 
     def _capture_loop(self):
         while self.running:
+            t0 = time.monotonic()
+
             frame = self.camera.read_frame() if self.camera else None
             if frame is None:
                 time.sleep(0.05)
@@ -259,27 +448,71 @@ class LeptonGUI:
             # Scale up for display
             dw = self.canvas.winfo_width() or pil_img.width * DISPLAY_SCALE
             dh = self.canvas.winfo_height() or pil_img.height * DISPLAY_SCALE
-            pil_img_display = pil_img.resize((dw, dh), Image.NEAREST)
-            tk_img = ImageTk.PhotoImage(pil_img_display)
+            display_img = pil_img.resize((dw, dh), Image.NEAREST)
+
+            # --- Person detection (runs every 3rd frame to stay smooth) ---
+            boxes, count = [], 0
+            if self._detect_enabled:
+                self._detect_frame_skip += 1
+                if self._detect_frame_skip >= 3:
+                    self._detect_frame_skip = 0
+                    sensitivity = self.sensitivity_var.get()
+                    # Map 0–1 slider to HOG threshold: 0→strict(0.0), 1→loose(-1.5)
+                    hog_thresh = -(sensitivity * 1.5)
+                    boxes, count = self._detector.detect(
+                        frame, dw, dh, sensitivity=hog_thresh
+                    )
+                    self._last_boxes = boxes
+                    self._last_count = count
+                    self.root.after(0, self._update_count_display, count)
+                else:
+                    boxes = self._last_boxes
+                    count = self._last_count
+
+                display_img = draw_detections(display_img, boxes, count)
+
+            tk_img = ImageTk.PhotoImage(display_img)
             self.root.after(0, self._update_canvas, tk_img)
 
-            # Write frame to video if recording
+            # --- Video recording ---
             if self._recording and self._video_writer is not None:
-                bgr = apply_colormap_bgr(frame, cmap_code)
+                if self.overlay_save_var.get() and self._detect_enabled:
+                    bgr = cv2.cvtColor(np.array(
+                        draw_detections(pil_img.resize((dw, dh), Image.NEAREST),
+                                        self._last_boxes, self._last_count)
+                    ), cv2.COLOR_RGB2BGR)
+                    # Resize back to native sensor resolution for the file
+                    wr_w, wr_h = self.camera.resolution
+                    bgr = cv2.resize(bgr, (wr_w, wr_h))
+                else:
+                    bgr = apply_colormap_bgr(frame, cmap_code)
                 self._video_writer.write(bgr)
                 self._video_frame_count += 1
                 elapsed = self._video_frame_count / self.fps_var.get()
                 self.root.after(0, self._update_rec_indicator, elapsed)
 
+            # --- Image capture ---
             if self._capture_requested:
                 self._capture_requested = False
-                self.root.after(0, self._save_image, frame.copy())
+                overlay = self._detect_enabled and self.overlay_save_var.get()
+                self.root.after(0, self._save_image, frame.copy(),
+                                list(self._last_boxes), self._last_count, overlay)
 
-            time.sleep(1.0 / max(self.fps_var.get(), 1))
+            # Pace to target FPS
+            elapsed = time.monotonic() - t0
+            sleep = max(0.0, (1.0 / max(self.fps_var.get(), 1)) - elapsed)
+            time.sleep(sleep)
 
     def _update_canvas(self, tk_img):
         self._img_ref = tk_img
         self.canvas.create_image(0, 0, anchor="nw", image=tk_img)
+
+    def _update_count_display(self, count: int):
+        self.count_var.set(str(count))
+        self.det_status_var.set(
+            "No persons" if count == 0 else
+            f"{'Person' if count == 1 else 'Persons'} in frame"
+        )
 
     def _update_rec_indicator(self, elapsed_seconds: float):
         m, s = divmod(int(elapsed_seconds), 60)
@@ -294,14 +527,20 @@ class LeptonGUI:
             return
         self._capture_requested = True
 
-    def _save_image(self, gray_frame: np.ndarray):
+    def _save_image(self, gray_frame: np.ndarray, boxes: list,
+                    count: int, with_overlay: bool):
         cmap_code = self._selected_cmap()
         pil_img = apply_colormap(gray_frame, cmap_code)
+        if with_overlay:
+            dw = self.canvas.winfo_width() or pil_img.width * DISPLAY_SCALE
+            dh = self.canvas.winfo_height() or pil_img.height * DISPLAY_SCALE
+            pil_img = draw_detections(
+                pil_img.resize((dw, dh), Image.NEAREST), boxes, count
+            )
 
         name = self._sanitise(self.filename_var.get() or "capture")
         save_dir = self.savedir_var.get().strip() or os.path.expanduser("~")
         os.makedirs(save_dir, exist_ok=True)
-
         path = self._unique_path(save_dir, name, ".png")
         pil_img.save(path)
         self.status_var.set(f"Image saved: {path}")
@@ -317,20 +556,15 @@ class LeptonGUI:
     def _start_recording(self):
         if not self.running or self.camera is None:
             return
-
         name = self._sanitise(self.filename_var.get() or "capture")
         save_dir = self.savedir_var.get().strip() or os.path.expanduser("~")
         os.makedirs(save_dir, exist_ok=True)
-
         fmt_name = self.vfmt_var.get()
         _, ext, fourcc = next(
-            (f for f in VIDEO_FORMATS if f[0] == fmt_name),
-            VIDEO_FORMATS[0],
+            (f for f in VIDEO_FORMATS if f[0] == fmt_name), VIDEO_FORMATS[0]
         )
-
         path = self._unique_path(save_dir, name, ext)
         w, h = self.camera.resolution
-
         writer = cv2.VideoWriter(path, fourcc, self.fps_var.get(), (w, h))
         if not writer.isOpened():
             messagebox.showerror(
@@ -339,12 +573,10 @@ class LeptonGUI:
                 "Try a different format or check codec availability."
             )
             return
-
         self._video_writer = writer
         self._video_path = path
         self._video_frame_count = 0
         self._recording = True
-
         self.record_btn.config(text="Stop Recording")
         self.rec_indicator.config(text="● REC  00:00  (0 frames)")
         self.status_var.set(f"Recording → {path}")
@@ -357,9 +589,21 @@ class LeptonGUI:
         self.record_btn.config(text="Start Recording")
         self.rec_indicator.config(text="")
         self.status_var.set(
-            f"Video saved: {self._video_path}  "
-            f"({self._video_frame_count} frames)"
+            f"Video saved: {self._video_path}  ({self._video_frame_count} frames)"
         )
+
+    # ------------------------------------------------------------------ detection toggle
+
+    def _on_detect_toggle(self):
+        self._detect_enabled = self.detect_var.get()
+        if self._detect_enabled:
+            self.count_var.set("0")
+            self.det_status_var.set("Scanning…")
+        else:
+            self.count_var.set("—")
+            self.det_status_var.set("Detection off")
+            self._last_boxes = []
+            self._last_count = 0
 
     # ------------------------------------------------------------------ helpers
 

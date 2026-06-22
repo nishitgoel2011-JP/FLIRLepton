@@ -440,11 +440,9 @@ class LeptonGUI:
                 self._detect_frame_skip += 1
                 if self._detect_frame_skip >= 3:
                     self._detect_frame_skip = 0
-                    sensitivity = self.sensitivity_var.get()
-                    # Map 0–1 slider to HOG threshold: 0→strict(0.0), 1→loose(-1.5)
-                    hog_thresh = -(sensitivity * 1.5)
+                    sensitivity = self.sensitivity_var.get()  # 0.0–1.0
                     boxes, count = self._detector.detect(
-                        frame, dw, dh, sensitivity=hog_thresh
+                        frame, dw, dh, sensitivity=sensitivity
                     )
                     self._last_boxes = boxes
                     self._last_count = count

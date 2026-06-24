@@ -182,6 +182,27 @@ def apply_colormap_bgr(gray_frame: np.ndarray, cmap_code) -> np.ndarray:
     return cv2.applyColorMap(gray_frame, cmap_code)
 
 
+def apply_circular_crop(pil_img: Image.Image, diameter: int) -> Image.Image:
+    """
+    Mask the image to a circle of `diameter` pixels centred on the frame.
+    Pixels outside the circle are set to black.  The output is the same
+    size as the input so the canvas layout does not change.
+    """
+    w, h = pil_img.size
+    d = max(1, min(diameter, w, h))   # clamp to image bounds
+    cx, cy = w // 2, h // 2
+    r = d // 2
+
+    # Greyscale mask: white circle on black background
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+
+    result = Image.new("RGB", (w, h), (0, 0, 0))
+    result.paste(pil_img, mask=mask)
+    return result
+
+
 def draw_detections(pil_img: Image.Image, boxes: list, count: int) -> Image.Image:
     """Draw bounding boxes and person count badge onto a PIL RGB image."""
     if not boxes and count == 0:
@@ -226,6 +247,7 @@ class LeptonGUI:
         self._recording = False
         self._video_frame_count = 0
         self._video_path = ""
+        self._video_writer_size = (80, 60)
 
         # Person detection
         self._detector = PersonDetector()
@@ -233,6 +255,9 @@ class LeptonGUI:
         self._detect_frame_skip = 0   # counter for throttling
         self._last_boxes: list = []
         self._last_count: int = 0
+
+        # Circular crop
+        self._crop_enabled = False
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -370,6 +395,37 @@ class LeptonGUI:
                  bg="#1a1a2e", fg="#888888",
                  font=("TkDefaultFont", 9)).pack(side="left", padx=12)
 
+        # ---- circular crop ----
+        crop_frame = ttk.LabelFrame(self.root, text="Circular Crop")
+        crop_frame.grid(row=6, column=0, columnspan=2, sticky="ew", **pad)
+
+        self.crop_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(crop_frame, text="Enable circular crop",
+                        variable=self.crop_var,
+                        command=self._on_crop_toggle).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+
+        ttk.Label(crop_frame, text="Diameter (px):").grid(row=1, column=0, sticky="w", **pad)
+        self.crop_diameter_var = tk.IntVar(value=240)
+        self.crop_spinbox = ttk.Spinbox(
+            crop_frame, from_=10, to=2048,
+            textvariable=self.crop_diameter_var, width=6,
+            command=self._on_diameter_change,
+        )
+        self.crop_spinbox.grid(row=1, column=1, sticky="w", **pad)
+
+        self.crop_slider = ttk.Scale(
+            crop_frame, from_=10, to=640, orient="horizontal",
+            variable=self.crop_diameter_var, length=160,
+            command=lambda _: self._on_diameter_change(),
+        )
+        self.crop_slider.grid(row=1, column=2, sticky="ew", **pad)
+
+        self.crop_info_var = tk.StringVar(value="")
+        ttk.Label(crop_frame, textvariable=self.crop_info_var,
+                  foreground="gray").grid(row=2, column=0, columnspan=3,
+                                         sticky="w", padx=6, pady=(0, 4))
+
     # ------------------------------------------------------------------ camera control
 
     def _toggle_camera(self):
@@ -391,8 +447,14 @@ class LeptonGUI:
         self.capture_btn.config(state="normal")
         self.record_btn.config(state="normal")
         w, h = cam.resolution
-        self.canvas.config(width=max(w, 80) * DISPLAY_SCALE,
-                           height=max(h, 60) * DISPLAY_SCALE)
+        dw, dh = max(w, 80) * DISPLAY_SCALE, max(h, 60) * DISPLAY_SCALE
+        self.canvas.config(width=dw, height=dh)
+        # Set crop slider/spinbox range to match display dimensions
+        max_d = min(dw, dh)
+        self.crop_slider.config(to=max_d)
+        self.crop_spinbox.config(to=max_d)
+        self.crop_diameter_var.set(max_d)
+        self.crop_info_var.set(f"Display size: {dw}×{dh} px  |  max diameter: {max_d} px")
         self.status_var.set(
             f"Running — {w}x{h} "
             f"({'Lepton 3.x' if h >= 120 else 'Lepton 2.x'})"
@@ -453,21 +515,26 @@ class LeptonGUI:
 
                 display_img = draw_detections(display_img, boxes, count)
 
+            # --- Circular crop ---
+            crop_diameter = self.crop_diameter_var.get() if self._crop_enabled else 0
+            if self._crop_enabled:
+                display_img = apply_circular_crop(display_img, crop_diameter)
+
             tk_img = ImageTk.PhotoImage(display_img)
             self.root.after(0, self._update_canvas, tk_img)
 
             # --- Video recording ---
             if self._recording and self._video_writer is not None:
+                # Build the save frame at display size (crop & overlay operate there)
+                save_img = pil_img.resize((dw, dh), Image.NEAREST)
                 if self.overlay_save_var.get() and self._detect_enabled:
-                    bgr = cv2.cvtColor(np.array(
-                        draw_detections(pil_img.resize((dw, dh), Image.NEAREST),
-                                        self._last_boxes, self._last_count)
-                    ), cv2.COLOR_RGB2BGR)
-                    # Resize back to native sensor resolution for the file
-                    wr_w, wr_h = self.camera.resolution
+                    save_img = draw_detections(save_img, self._last_boxes, self._last_count)
+                if self._crop_enabled:
+                    save_img = apply_circular_crop(save_img, crop_diameter)
+                bgr = cv2.cvtColor(np.array(save_img), cv2.COLOR_RGB2BGR)
+                wr_w, wr_h = self._video_writer_size
+                if (bgr.shape[1], bgr.shape[0]) != (wr_w, wr_h):
                     bgr = cv2.resize(bgr, (wr_w, wr_h))
-                else:
-                    bgr = apply_colormap_bgr(frame, cmap_code)
                 self._video_writer.write(bgr)
                 self._video_frame_count += 1
                 elapsed = self._video_frame_count / self.fps_var.get()
@@ -478,7 +545,9 @@ class LeptonGUI:
                 self._capture_requested = False
                 overlay = self._detect_enabled and self.overlay_save_var.get()
                 self.root.after(0, self._save_image, frame.copy(),
-                                list(self._last_boxes), self._last_count, overlay)
+                                list(self._last_boxes), self._last_count,
+                                overlay, self._crop_enabled, crop_diameter,
+                                dw, dh)
 
             # Pace to target FPS
             elapsed = time.monotonic() - t0
@@ -510,15 +579,19 @@ class LeptonGUI:
         self._capture_requested = True
 
     def _save_image(self, gray_frame: np.ndarray, boxes: list,
-                    count: int, with_overlay: bool):
+                    count: int, with_overlay: bool,
+                    with_crop: bool = False, crop_diameter: int = 0,
+                    dw: int = 0, dh: int = 0):
         cmap_code = self._selected_cmap()
         pil_img = apply_colormap(gray_frame, cmap_code)
-        if with_overlay:
-            dw = self.canvas.winfo_width() or pil_img.width * DISPLAY_SCALE
-            dh = self.canvas.winfo_height() or pil_img.height * DISPLAY_SCALE
-            pil_img = draw_detections(
-                pil_img.resize((dw, dh), Image.NEAREST), boxes, count
-            )
+        if with_overlay or with_crop:
+            dw = dw or self.canvas.winfo_width() or pil_img.width * DISPLAY_SCALE
+            dh = dh or self.canvas.winfo_height() or pil_img.height * DISPLAY_SCALE
+            pil_img = pil_img.resize((dw, dh), Image.NEAREST)
+            if with_overlay:
+                pil_img = draw_detections(pil_img, boxes, count)
+            if with_crop:
+                pil_img = apply_circular_crop(pil_img, crop_diameter)
 
         name = self._sanitise(self.filename_var.get() or "capture")
         save_dir = self.savedir_var.get().strip() or os.path.expanduser("~")
@@ -546,8 +619,16 @@ class LeptonGUI:
             (f for f in VIDEO_FORMATS if f[0] == fmt_name), VIDEO_FORMATS[0]
         )
         path = self._unique_path(save_dir, name, ext)
-        w, h = self.camera.resolution
-        writer = cv2.VideoWriter(path, fourcc, self.fps_var.get(), (w, h))
+        src_w, src_h = self.camera.resolution
+        dw = max(src_w, 80) * DISPLAY_SCALE
+        dh = max(src_h, 60) * DISPLAY_SCALE
+        # Use display dimensions when crop or detection overlay is active
+        if self._crop_enabled or (self._detect_enabled and self.overlay_save_var.get()):
+            wr_size = (dw, dh)
+        else:
+            wr_size = (src_w, src_h)
+        self._video_writer_size = wr_size
+        writer = cv2.VideoWriter(path, fourcc, self.fps_var.get(), wr_size)
         if not writer.isOpened():
             messagebox.showerror(
                 "Video Error",
@@ -617,6 +698,23 @@ class LeptonGUI:
             path = os.path.join(directory, f"{base}_{counter}{ext}")
             counter += 1
         return path
+
+    # ------------------------------------------------------------------ crop toggle
+
+    def _on_crop_toggle(self):
+        self._crop_enabled = self.crop_var.get()
+
+    def _on_diameter_change(self):
+        # Keep spinbox and slider in sync; clamp to valid range
+        try:
+            d = int(self.crop_diameter_var.get())
+        except (tk.TclError, ValueError):
+            return
+        dw = self.canvas.winfo_width() or 320
+        dh = self.canvas.winfo_height() or 240
+        clamped = max(10, min(d, min(dw, dh)))
+        if clamped != d:
+            self.crop_diameter_var.set(clamped)
 
     def _on_close(self):
         if self._recording:

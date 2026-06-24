@@ -234,7 +234,8 @@ class LeptonGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("FLIR Lepton IR Camera")
-        self.root.resizable(False, False)
+        self.root.resizable(False, True)
+        self.root.grid_rowconfigure(0, weight=1)   # canvas row stretches vertically
 
         self.camera: LeptonCamera | None = None
         self.running = False
@@ -271,7 +272,7 @@ class LeptonGUI:
         self.canvas = tk.Canvas(self.root, bg="black",
                                 width=80 * DISPLAY_SCALE,
                                 height=60 * DISPLAY_SCALE)
-        self.canvas.grid(row=0, column=0, columnspan=2, **pad)
+        self.canvas.grid(row=0, column=0, columnspan=2, sticky="nsew", **pad)
         self._img_ref = None
 
         # ---- status bar ----

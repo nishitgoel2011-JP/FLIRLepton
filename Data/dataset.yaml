@@ -1,0 +1,6 @@
+path: C:\Users\nishit.goel\Documents\Github_pvt\FLIRLepton\Data
+train: images/train
+val:   images/val
+
+nc: 1
+names: ['person']
